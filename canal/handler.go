@@ -24,7 +24,7 @@ type EventHandler interface {
 	OnRowsQueryEvent(e *replication.RowsQueryEvent) error
 	// OnTableNotFound is called when a Rows Event references a table object
 	// that no longer exists.
-	OnTableNotFound(*replication.RowsEvent) error
+	OnTableNotFound(*replication.EventHeader, *replication.RowsEvent) error
 	String() string
 }
 
@@ -55,7 +55,7 @@ func (h *DummyEventHandler) OnRowsQueryEvent(*replication.RowsQueryEvent) error 
 	return nil
 }
 
-func (h *DummyEventHandler) OnTableNotFound(*replication.RowsEvent) error {
+func (h *DummyEventHandler) OnTableNotFound(header *replication.EventHeader, e *replication.RowsEvent) error {
 	return schema.ErrTableNotExist
 }
 

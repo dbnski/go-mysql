@@ -277,7 +277,7 @@ func (c *Canal) handleRowsEvent(e *replication.BinlogEvent) error {
 		}
 		// Allow handler to decide what to do when table is missing.
 		if cause == schema.ErrTableNotExist {
-			return c.eventHandler.OnTableNotFound(ev)
+			return c.eventHandler.OnTableNotFound(e.Header, ev)
 		}
 		return err
 	}
