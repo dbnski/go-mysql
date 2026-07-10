@@ -119,10 +119,55 @@ func (s *schemaTestSuite) TestSchema() {
 	require.Equal(s.T(), uint(12), ta.Columns[14].MaxSize)
 	require.Equal(s.T(), uint(0), ta.Columns[14].FixedSize)
 
-	taSqlDb, err := NewTableFromSqlDB(s.sqlDB, *schema, "schema_test")
+	taSQLDb, err := NewTableFromSqlDB(s.sqlDB, *schema, "schema_test")
 	require.NoError(s.T(), err)
 
-	require.Equal(s.T(), ta, taSqlDb)
+	require.Equal(s.T(), ta, taSQLDb)
+}
+
+func (s *schemaTestSuite) TestSchemaColumnExtraFlags() {
+	_, err := s.conn.Execute(`DROP TABLE IF EXISTS schema_column_extra_flags_test`)
+	require.NoError(s.T(), err)
+
+	// DEFAULT (expr) is supported since MySQL 8.0.13. If the server is older,
+	// fallback to a table that only validates the ON UPDATE parsing.
+	create := `
+        CREATE TABLE IF NOT EXISTS schema_column_extra_flags_test (
+            id INT PRIMARY KEY,
+            ts TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+            expr INT DEFAULT (1+1)
+        ) ENGINE = INNODB;
+    `
+	_, err = s.conn.Execute(create)
+	if err != nil {
+		createFallback := `
+            CREATE TABLE IF NOT EXISTS schema_column_extra_flags_test (
+                id INT PRIMARY KEY,
+                ts TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE = INNODB;
+        `
+		_, err = s.conn.Execute(createFallback)
+		require.NoError(s.T(), err)
+	}
+
+	ta, err := NewTable(s.conn, *schema, "schema_column_extra_flags_test")
+	require.NoError(s.T(), err)
+
+	tsIdx := ta.FindColumn("ts")
+	require.GreaterOrEqual(s.T(), tsIdx, 0)
+	require.True(s.T(), ta.Columns[tsIdx].IsAutoUpdating)
+	require.False(s.T(), ta.Columns[tsIdx].IsDefaultExpr)
+
+	exprIdx := ta.FindColumn("expr")
+	if exprIdx >= 0 {
+		require.True(s.T(), ta.Columns[exprIdx].IsDefaultExpr)
+		require.False(s.T(), ta.Columns[exprIdx].IsAutoUpdating)
+	}
+
+	taSQLDb, err := NewTableFromSqlDB(s.sqlDB, *schema, "schema_column_extra_flags_test")
+	require.NoError(s.T(), err)
+
+	require.Equal(s.T(), ta, taSQLDb)
 }
 
 func (s *schemaTestSuite) TestQuoteSchema() {
@@ -169,8 +214,180 @@ func (s *schemaTestSuite) TestSchemaWithMultiValueIndex() {
 	require.Len(s.T(), ta.Indexes[1].Columns, 1)
 	require.Equal(s.T(), "", ta.Indexes[1].Columns[0])
 
-	taSqlDb, err := NewTableFromSqlDB(s.sqlDB, *schema, "multi_value_idx_test")
+	taSQLDb, err := NewTableFromSqlDB(s.sqlDB, *schema, "multi_value_idx_test")
 	require.NoError(s.T(), err)
 
-	require.Equal(s.T(), ta, taSqlDb)
+	require.Equal(s.T(), ta, taSQLDb)
+}
+
+func (s *schemaTestSuite) TestSchemaWithInvisibleIndex() {
+	_, err := s.conn.Execute(`DROP TABLE IF EXISTS invisible_idx_test`)
+	require.NoError(s.T(), err)
+
+	// Create table first to check invisible index support via column presence
+	str := `
+        CREATE TABLE IF NOT EXISTS invisible_idx_test (
+            id INT,
+            name VARCHAR(256),
+            email VARCHAR(256),
+            PRIMARY KEY(id),
+            INDEX name_idx (name),
+            INDEX email_idx (email)
+        ) ENGINE = INNODB;
+    `
+
+	_, err = s.conn.Execute(str)
+	require.NoError(s.T(), err)
+
+	// Check if invisible index support exists by checking SHOW INDEX columns
+	r, err := s.conn.Execute(fmt.Sprintf("SHOW INDEX FROM `%s`.`%s`", *schema, "invisible_idx_test"))
+	require.NoError(s.T(), err)
+	hasInvisibleIndex := hasInvisibleIndexSupportFromResult(r)
+
+	// Add INVISIBLE keyword only if database supports it
+	if hasInvisibleIndex {
+		_, err = s.conn.Execute(`ALTER TABLE invisible_idx_test ALTER INDEX name_idx INVISIBLE`)
+		require.NoError(s.T(), err)
+	}
+
+	ta, err := NewTable(s.conn, *schema, "invisible_idx_test")
+	require.NoError(s.T(), err)
+
+	require.Len(s.T(), ta.Indexes, 3)
+
+	// PRIMARY key should always be visible
+	require.Equal(s.T(), "PRIMARY", ta.Indexes[0].Name)
+	require.True(s.T(), ta.Indexes[0].Visible)
+
+	// Find name_idx and email_idx (order may vary)
+	var nameIdx, emailIdx *Index
+	for _, idx := range ta.Indexes {
+		switch idx.Name {
+		case "name_idx":
+			nameIdx = idx
+		case "email_idx":
+			emailIdx = idx
+		}
+	}
+
+	require.NotNil(s.T(), nameIdx)
+	require.NotNil(s.T(), emailIdx)
+
+	// email_idx should always be visible (default)
+	require.True(s.T(), emailIdx.Visible)
+
+	// name_idx visibility depends on database support for invisible indexes
+	if hasInvisibleIndex {
+		require.False(s.T(), nameIdx.Visible, "name_idx should be invisible when database supports invisible indexes")
+	} else {
+		require.True(s.T(), nameIdx.Visible, "name_idx should be visible when database doesn't support invisible indexes")
+	}
+
+	taSQLDb, err := NewTableFromSqlDB(s.sqlDB, *schema, "invisible_idx_test")
+	require.NoError(s.T(), err)
+
+	require.Equal(s.T(), ta, taSQLDb)
+}
+
+func (s *schemaTestSuite) TestInvisibleIndexColumnDetection() {
+	_, err := s.conn.Execute(`DROP TABLE IF EXISTS column_detection_test`)
+	require.NoError(s.T(), err)
+
+	str := `
+        CREATE TABLE IF NOT EXISTS column_detection_test (
+            id INT PRIMARY KEY,
+            name VARCHAR(256),
+            INDEX name_idx (name)
+        ) ENGINE = INNODB;
+    `
+
+	_, err = s.conn.Execute(str)
+	require.NoError(s.T(), err)
+
+	// Test both detection functions work consistently
+	r, err := s.conn.Execute(fmt.Sprintf("SHOW INDEX FROM `%s`.`%s`", *schema, "column_detection_test"))
+	require.NoError(s.T(), err)
+
+	hasInvisibleFromResult := hasInvisibleIndexSupportFromResult(r)
+
+	// Get columns and test the other detection function
+	cols, err := s.sqlDB.Query(fmt.Sprintf("SHOW INDEX FROM `%s`.`%s`", *schema, "column_detection_test"))
+	require.NoError(s.T(), err)
+	defer cols.Close()
+
+	columnNames, err := cols.Columns()
+	require.NoError(s.T(), err)
+	hasInvisibleFromColumns := hasInvisibleIndexSupportFromColumns(columnNames)
+
+	// Both detection methods should agree
+	require.Equal(s.T(), hasInvisibleFromResult, hasInvisibleFromColumns, "Detection methods should be consistent")
+
+	// Test that both connection types work identically
+	ta1, err := NewTable(s.conn, *schema, "column_detection_test")
+	require.NoError(s.T(), err)
+
+	ta2, err := NewTableFromSqlDB(s.sqlDB, *schema, "column_detection_test")
+	require.NoError(s.T(), err)
+
+	require.Equal(s.T(), ta1, ta2, "Both connection types should produce identical results")
+}
+
+func TestInvisibleIndexLogic(t *testing.T) {
+	// Test MySQL-style visibility logic
+	require.True(t, isIndexInvisible("NO"), "Visible=NO should be invisible")
+	require.False(t, isIndexInvisible("YES"), "Visible=YES should be visible")
+
+	// Test case insensitivity
+	require.True(t, isIndexInvisible("no"), "Should be case insensitive")
+	require.True(t, isIndexInvisible("No"), "Should be case insensitive")
+	require.False(t, isIndexInvisible("yes"), "Should be case insensitive")
+	require.False(t, isIndexInvisible("YES"), "Should be case insensitive")
+
+	// Test other values default to visible
+	require.False(t, isIndexInvisible(""), "Empty string should default to visible")
+	require.False(t, isIndexInvisible("UNKNOWN"), "Unknown value should default to visible")
+}
+
+func TestIndexVisibilityDefault(t *testing.T) {
+	// Test that NewIndex creates visible indexes by default
+	idx := NewIndex("test_index")
+	require.True(t, idx.Visible)
+
+	// Test AddIndex creates visible indexes by default
+	ta := &Table{Schema: "test", Name: "test_table"}
+	addedIdx := ta.AddIndex("added_index")
+	require.True(t, addedIdx.Visible)
+}
+
+func (s *schemaTestSuite) TestVisibleFieldInSchema() {
+	_, err := s.conn.Execute(`DROP TABLE IF EXISTS visible_field_test`)
+	require.NoError(s.T(), err)
+
+	str := `
+        CREATE TABLE IF NOT EXISTS visible_field_test (
+            id INT,
+            name VARCHAR(256),
+            PRIMARY KEY(id),
+            INDEX name_idx (name)
+        ) ENGINE = INNODB;
+    `
+
+	_, err = s.conn.Execute(str)
+	require.NoError(s.T(), err)
+
+	ta, err := NewTable(s.conn, *schema, "visible_field_test")
+	require.NoError(s.T(), err)
+
+	// All indexes should be visible by default
+	for _, idx := range ta.Indexes {
+		require.True(s.T(), idx.Visible, "Index %s should be visible by default", idx.Name)
+	}
+
+	// Test with SQL DB connection as well
+	taSQLDb, err := NewTableFromSqlDB(s.sqlDB, *schema, "visible_field_test")
+	require.NoError(s.T(), err)
+
+	for _, idx := range taSQLDb.Indexes {
+		require.True(s.T(), idx.Visible, "Index %s should be visible by default (SQL DB)", idx.Name)
+	}
 }

@@ -5,10 +5,14 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
+	"log"
+	"maps"
 	"math/bits"
 	"net"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"time"
 
@@ -45,6 +49,9 @@ type Conn struct {
 	capability uint32
 	// client-set capabilities only
 	ccaps uint32
+	// Capability flags explicitly disabled by the client via UnsetCapability()
+	// These flags are removed from the final advertised capability set during handshake.
+	clientExplicitOffCaps uint32
 
 	attributes map[string]string
 
@@ -234,19 +241,26 @@ func (c *Conn) Ping() error {
 	return nil
 }
 
-// SetCapability enables the use of a specific capability
-func (c *Conn) SetCapability(cap uint32) {
-	c.ccaps |= cap
+// SetCapability marks the specified flag as explicitly enabled by the client.
+func (c *Conn) SetCapability(capability uint32) error {
+	if !slices.Contains(optionalCapabilities, capability) {
+		return errors.New("unsupported or unknown capability")
+	}
+	c.ccaps |= capability
+	c.clientExplicitOffCaps &^= capability
+	return nil
 }
 
-// UnsetCapability disables the use of a specific capability
-func (c *Conn) UnsetCapability(cap uint32) {
-	c.ccaps &= ^cap
+// UnsetCapability marks the specified flag as explicitly disabled by the client.
+// This disables the flag even if the server supports it.
+func (c *Conn) UnsetCapability(capability uint32) {
+	c.ccaps &^= capability
+	c.clientExplicitOffCaps |= capability
 }
 
 // HasCapability returns true if the connection has the specific capability
-func (c *Conn) HasCapability(cap uint32) bool {
-	return c.ccaps&cap > 0
+func (c *Conn) HasCapability(capability uint32) bool {
+	return c.ccaps&capability != 0
 }
 
 // UseSSL: use default SSL
@@ -262,20 +276,23 @@ func (c *Conn) SetTLSConfig(config *tls.Config) {
 }
 
 func (c *Conn) UseDB(dbName string) error {
-	if c.db == dbName {
-		return nil
-	}
+	_, err := c.UseDBWithResult(dbName)
+	return err
+}
 
+func (c *Conn) UseDBWithResult(dbName string) (*mysql.Result, error) {
 	if err := c.writeCommandStr(mysql.COM_INIT_DB, dbName); err != nil {
-		return errors.Trace(err)
+		return nil, errors.Trace(err)
 	}
 
-	if _, err := c.readOK(); err != nil {
-		return errors.Trace(err)
+	var r *mysql.Result
+	var err error
+	if r, err = c.readOK(); err != nil {
+		return r, errors.Trace(err)
 	}
 
 	c.db = dbName
-	return nil
+	return r, nil
 }
 
 func (c *Conn) GetDB() string {
@@ -295,19 +312,18 @@ func (c *Conn) CompareServerVersion(v string) (int, error) {
 	return mysql.CompareServerVersions(c.serverVersion, v)
 }
 
-func (c *Conn) Execute(command string, args ...interface{}) (*mysql.Result, error) {
+func (c *Conn) Execute(command string, args ...any) (*mysql.Result, error) {
 	if len(args) == 0 {
 		return c.exec(command)
-	} else {
-		if s, err := c.Prepare(command); err != nil {
-			return nil, errors.Trace(err)
-		} else {
-			var r *mysql.Result
-			r, err = s.Execute(args...)
-			s.Close()
-			return r, err
-		}
 	}
+	s, err := c.Prepare(command)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	var r *mysql.Result
+	r, err = s.Execute(args...)
+	s.Close()
+	return r, err
 }
 
 // ExecuteMultiple will call perResultCallback for every result of the multiple queries
@@ -377,6 +393,184 @@ func (c *Conn) ExecuteSelectStreaming(command string, result *mysql.Result, perR
 	return c.readResultStreaming(false, result, perRowCallback, perResultCallback)
 }
 
+// prepareLocalInfileReader fully validates that r can be read without error before any data is
+// sent upstream, per the LOCAL INFILE protocol requirement that on error the server must see
+// only the terminal empty packet, never a truncated file. If r implements io.Seeker (as returned
+// by callers per the documented example: *bytes.Reader, *os.File) it is drained and seeked back
+// to the start so large files are not fully buffered in memory; otherwise the content is read
+// fully into memory with io.ReadAll.
+func prepareLocalInfileReader(r io.Reader) (io.Reader, error) {
+	if r == nil {
+		return bytes.NewReader(nil), nil
+	}
+	if seeker, ok := r.(io.Seeker); ok {
+		if _, err := io.Copy(io.Discard, r); err != nil {
+			return nil, err
+		}
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
+	content, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(content), nil
+}
+
+func (c *Conn) writeLocalInfileTerminator() error {
+	return c.WritePacket(make([]byte, 4))
+}
+
+// streamLocalInfileChunks sends already-validated file bytes as LOCAL INFILE data packets,
+// followed by the terminal empty packet.
+func (c *Conn) streamLocalInfileChunks(r io.Reader) error {
+	buf := make([]byte, 4+defaultBufferSize)
+	sentData := false
+	for {
+		n, err := r.Read(buf[4:])
+		if n > 0 {
+			if werr := c.WritePacket(buf[:4+n]); werr != nil {
+				if tErr := c.writeLocalInfileTerminator(); tErr != nil {
+					log.Printf("go-mysql: failed to send LOCAL INFILE terminator after write error: %v", tErr)
+				}
+				return errors.Trace(werr)
+			}
+			sentData = true
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			if sentData {
+				if tErr := c.writeLocalInfileTerminator(); tErr != nil {
+					log.Printf("go-mysql: failed to send LOCAL INFILE terminator after read error: %v", tErr)
+				}
+			}
+			return errors.Trace(err)
+		}
+	}
+	if err := c.writeLocalInfileTerminator(); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+// sendLocalInfileContentAndAwaitResult validates and sends LOCAL INFILE content, then reads the
+// server's OK or ERR. When relayErr is non-nil, or when reader validation fails, only the empty
+// terminator packet is sent (no file data).
+func (c *Conn) sendLocalInfileContentAndAwaitResult(reader io.Reader, relayErr error) (*mysql.Result, error) {
+	content := io.Reader(bytes.NewReader(nil))
+	if relayErr == nil {
+		validated, err := prepareLocalInfileReader(reader)
+		if err != nil {
+			relayErr = err
+		} else {
+			content = validated
+		}
+	}
+	streamErr := error(nil)
+	if err := c.streamLocalInfileChunks(content); err != nil {
+		streamErr = err
+	}
+	if relayErr == nil && streamErr != nil {
+		relayErr = streamErr
+	}
+	resp, err := c.ReadPacket()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if len(resp) == 0 {
+		return nil, errors.New("unexpected empty packet after LOCAL INFILE")
+	}
+	var result *mysql.Result
+	var respErr error
+	switch resp[0] {
+	case mysql.OK_HEADER:
+		result, respErr = c.handleOKPacket(resp)
+	case mysql.ERR_HEADER:
+		respErr = c.handleErrorPacket(resp)
+	default:
+		respErr = errors.Errorf("unexpected packet after LOCAL INFILE: 0x%x", resp[0])
+	}
+	if relayErr != nil {
+		if respErr != nil {
+			return nil, errors.Errorf("local infile relay failed: %v; server response: %v", relayErr, respErr)
+		}
+		return nil, errors.Trace(relayErr)
+	}
+	return result, errors.Trace(respErr)
+}
+
+// ExecQueryRelayLocalInfile sends COM_QUERY and handles the LOCAL INFILE protocol when the server
+// responds with a 0xfb packet. relayFile receives the filename bytes from that request (without the
+// 0xfb header) and must return a reader over the complete file content (or nil for an empty file).
+// The library validates the reader, sends data packets and the terminal empty packet, then returns
+// the final OK or ERR.
+//
+// If relayFile returns an error, or the reader cannot be fully read, no file data is sent upstream;
+// only the empty terminator packet is sent so the connection can be reused.
+//
+// Notes:
+//   - This function is intended for LOAD DATA LOCAL INFILE queries.
+//   - relayFile is only invoked when the server responds with LocalInFile_HEADER (0xfb).
+//   - Direct OK or ERR (no 0xfb) occurs when the server rejects the statement before requesting a
+//     file — e.g. local_infile disabled, missing privileges, or a syntax error. Handling these
+//     responses keeps the connection usable, consistent with readResultStreaming and
+//     ExecuteMultiple.
+//
+// This is the proxy-friendly counterpart to the local-file reading in client/auth.go. It does not
+// access the filesystem; ownership of the file transfer is delegated entirely to the caller.
+//
+// Example (MySQL proxy relaying LOAD DATA LOCAL INFILE from an application client to upstream):
+//
+//	result, err := upstream.ExecQueryRelayLocalInfile(query, func(filename []byte) (io.Reader, error) {
+//	    if err := downstream.WritePacket(wrapPacket(append([]byte{mysql.LocalInFile_HEADER}, filename...))); err != nil {
+//	        return nil, err
+//	    }
+//	    var buf bytes.Buffer
+//	    for {
+//	        pkt, err := downstream.ReadPacket()
+//	        if err != nil {
+//	            return nil, err
+//	        }
+//	        if len(pkt) == 0 {
+//	            break // empty packet = end of file from client
+//	        }
+//	        if _, err := buf.Write(pkt); err != nil {
+//	            return nil, err
+//	        }
+//	    }
+//	    return bytes.NewReader(buf.Bytes()), nil
+//	})
+func (c *Conn) ExecQueryRelayLocalInfile(query string, relayFile func(filename []byte) (io.Reader, error)) (*mysql.Result, error) {
+	if err := c.execSend(query); err != nil {
+		return nil, errors.Trace(err)
+	}
+	data, err := c.ReadPacket()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if len(data) == 0 {
+		return nil, errors.New("unexpected empty packet from server")
+	}
+	switch data[0] {
+	case mysql.OK_HEADER:
+		return c.handleOKPacket(data)
+	case mysql.ERR_HEADER:
+		return nil, c.handleErrorPacket(data)
+	case mysql.LocalInFile_HEADER:
+		reader, relayErr := relayFile(data[1:])
+		if closer, ok := reader.(io.Closer); ok && reader != nil {
+			defer closer.Close()
+		}
+		return c.sendLocalInfileContentAndAwaitResult(reader, relayErr)
+	default:
+		return nil, errors.Errorf("unexpected response to COM_QUERY (expected OK, ERR, or LOCAL INFILE): 0x%x", data[0])
+	}
+}
+
 func (c *Conn) Begin() error {
 	_, err := c.exec("BEGIN")
 	return errors.Trace(err)
@@ -409,9 +603,7 @@ func (c *Conn) Rollback() error {
 
 // SetAttributes sets connection attributes
 func (c *Conn) SetAttributes(attributes map[string]string) {
-	for k, v := range attributes {
-		c.attributes[k] = v
-	}
+	maps.Copy(c.attributes, attributes)
 }
 
 func (c *Conn) SetCharset(charset string) error {
@@ -421,10 +613,9 @@ func (c *Conn) SetCharset(charset string) error {
 
 	if _, err := c.exec(fmt.Sprintf("SET NAMES %s", charset)); err != nil {
 		return errors.Trace(err)
-	} else {
-		c.charset = charset
-		return nil
 	}
+	c.charset = charset
+	return nil
 }
 
 func (c *Conn) SetCollation(collation string) error {
@@ -579,72 +770,9 @@ func (c *Conn) CapabilityString() string {
 		field := uint32(1 << bits.TrailingZeros32(capability))
 		capability ^= field
 
-		switch field {
-		case mysql.CLIENT_LONG_PASSWORD:
-			caps = append(caps, "CLIENT_LONG_PASSWORD")
-		case mysql.CLIENT_FOUND_ROWS:
-			caps = append(caps, "CLIENT_FOUND_ROWS")
-		case mysql.CLIENT_LONG_FLAG:
-			caps = append(caps, "CLIENT_LONG_FLAG")
-		case mysql.CLIENT_CONNECT_WITH_DB:
-			caps = append(caps, "CLIENT_CONNECT_WITH_DB")
-		case mysql.CLIENT_NO_SCHEMA:
-			caps = append(caps, "CLIENT_NO_SCHEMA")
-		case mysql.CLIENT_COMPRESS:
-			caps = append(caps, "CLIENT_COMPRESS")
-		case mysql.CLIENT_ODBC:
-			caps = append(caps, "CLIENT_ODBC")
-		case mysql.CLIENT_LOCAL_FILES:
-			caps = append(caps, "CLIENT_LOCAL_FILES")
-		case mysql.CLIENT_IGNORE_SPACE:
-			caps = append(caps, "CLIENT_IGNORE_SPACE")
-		case mysql.CLIENT_PROTOCOL_41:
-			caps = append(caps, "CLIENT_PROTOCOL_41")
-		case mysql.CLIENT_INTERACTIVE:
-			caps = append(caps, "CLIENT_INTERACTIVE")
-		case mysql.CLIENT_SSL:
-			caps = append(caps, "CLIENT_SSL")
-		case mysql.CLIENT_IGNORE_SIGPIPE:
-			caps = append(caps, "CLIENT_IGNORE_SIGPIPE")
-		case mysql.CLIENT_TRANSACTIONS:
-			caps = append(caps, "CLIENT_TRANSACTIONS")
-		case mysql.CLIENT_RESERVED:
-			caps = append(caps, "CLIENT_RESERVED")
-		case mysql.CLIENT_SECURE_CONNECTION:
-			caps = append(caps, "CLIENT_SECURE_CONNECTION")
-		case mysql.CLIENT_MULTI_STATEMENTS:
-			caps = append(caps, "CLIENT_MULTI_STATEMENTS")
-		case mysql.CLIENT_MULTI_RESULTS:
-			caps = append(caps, "CLIENT_MULTI_RESULTS")
-		case mysql.CLIENT_PS_MULTI_RESULTS:
-			caps = append(caps, "CLIENT_PS_MULTI_RESULTS")
-		case mysql.CLIENT_PLUGIN_AUTH:
-			caps = append(caps, "CLIENT_PLUGIN_AUTH")
-		case mysql.CLIENT_CONNECT_ATTRS:
-			caps = append(caps, "CLIENT_CONNECT_ATTRS")
-		case mysql.CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA:
-			caps = append(caps, "CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA")
-		case mysql.CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS:
-			caps = append(caps, "CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS")
-		case mysql.CLIENT_SESSION_TRACK:
-			caps = append(caps, "CLIENT_SESSION_TRACK")
-		case mysql.CLIENT_DEPRECATE_EOF:
-			caps = append(caps, "CLIENT_DEPRECATE_EOF")
-		case mysql.CLIENT_OPTIONAL_RESULTSET_METADATA:
-			caps = append(caps, "CLIENT_OPTIONAL_RESULTSET_METADATA")
-		case mysql.CLIENT_ZSTD_COMPRESSION_ALGORITHM:
-			caps = append(caps, "CLIENT_ZSTD_COMPRESSION_ALGORITHM")
-		case mysql.CLIENT_QUERY_ATTRIBUTES:
-			caps = append(caps, "CLIENT_QUERY_ATTRIBUTES")
-		case mysql.MULTI_FACTOR_AUTHENTICATION:
-			caps = append(caps, "MULTI_FACTOR_AUTHENTICATION")
-		case mysql.CLIENT_CAPABILITY_EXTENSION:
-			caps = append(caps, "CLIENT_CAPABILITY_EXTENSION")
-		case mysql.CLIENT_SSL_VERIFY_SERVER_CERT:
-			caps = append(caps, "CLIENT_SSL_VERIFY_SERVER_CERT")
-		case mysql.CLIENT_REMEMBER_OPTIONS:
-			caps = append(caps, "CLIENT_REMEMBER_OPTIONS")
-		default:
+		if capname, ok := mysql.CapNames[field]; ok {
+			caps = append(caps, capname)
+		} else {
 			caps = append(caps, fmt.Sprintf("(%d)", field))
 		}
 	}

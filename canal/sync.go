@@ -2,7 +2,6 @@ package canal
 
 import (
 	"log/slog"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -23,15 +22,14 @@ func (c *Canal) startSyncer() (*replication.BinlogStreamer, error) {
 		}
 		c.cfg.Logger.Info("start sync binlog at binlog file", slog.Any("pos", pos))
 		return s, nil
-	} else {
-		gsetClone := gset.Clone()
-		s, err := c.syncer.StartSyncGTID(gset)
-		if err != nil {
-			return nil, errors.Errorf("start sync replication at GTID set %v error %v", gset, err)
-		}
-		c.cfg.Logger.Info("start sync binlog at GTID set", slog.Any("gset", gsetClone))
-		return s, nil
 	}
+	gsetClone := gset.Clone()
+	s, err := c.syncer.StartSyncGTID(gset)
+	if err != nil {
+		return nil, errors.Errorf("start sync replication at GTID set %v error %v", gset, err)
+	}
+	c.cfg.Logger.Info("start sync binlog at GTID set", slog.Any("gset", gsetClone))
+	return s, nil
 }
 
 func (c *Canal) runSyncBinlog() error {
@@ -147,10 +145,13 @@ func (c *Canal) handleEvent(ev *replication.BinlogEvent) error {
 			c.cfg.Logger.Error("error parsing query, will skip this event", slog.String("query", string(e.Query)), slog.Any("error", err))
 			return nil
 		}
-		if len(stmts) > 0 {
-			savePos = true
-		}
 		for _, stmt := range stmts {
+			switch stmt.(type) {
+			case *ast.BeginStmt, *ast.SavepointStmt:
+				// transaction not yet complete; checkpointing here would skip it on GTID resume
+				continue
+			}
+			savePos = true
 			nodes := parseStmt(stmt)
 			for _, node := range nodes {
 				if node.db == "" {
@@ -250,7 +251,7 @@ func (c *Canal) updateTable(header *replication.EventHeader, db, table string) (
 	if err = c.eventHandler.OnTableChanged(header, db, table); err != nil && errors.Cause(err) != schema.ErrTableNotExist {
 		return errors.Trace(err)
 	}
-	return
+	return err
 }
 
 func (c *Canal) updateReplicationDelay(ev *replication.BinlogEvent) {
@@ -259,7 +260,7 @@ func (c *Canal) updateReplicationDelay(ev *replication.BinlogEvent) {
 	if now >= ev.Header.Timestamp {
 		newDelay = now - ev.Header.Timestamp
 	}
-	atomic.StoreUint32(c.delay, newDelay)
+	c.delay.Store(newDelay)
 }
 
 func (c *Canal) handleRowsEvent(e *replication.BinlogEvent) error {
@@ -271,12 +272,15 @@ func (c *Canal) handleRowsEvent(e *replication.BinlogEvent) error {
 
 	t, err := c.GetTable(schemaName, tableName)
 	if err != nil {
-		e := errors.Cause(err)
+		cause := errors.Cause(err)
 		// ignore errors below
-		if e == ErrExcludedTable || e == schema.ErrTableNotExist || e == schema.ErrMissingTableMeta {
-			err = nil
+		if cause == ErrExcludedTable || cause == schema.ErrMissingTableMeta {
+			return nil
 		}
-
+		// Allow handler to decide what to do when table is missing.
+		if cause == schema.ErrTableNotExist {
+			return c.eventHandler.OnTableNotFound(e.Header, ev)
+		}
 		return err
 	}
 	var action string
@@ -324,13 +328,34 @@ func (c *Canal) WaitUntilPos(pos mysql.Position, timeout time.Duration) error {
 	}
 }
 
-func (c *Canal) GetMasterPos() (mysql.Position, error) {
-	showBinlogStatus := "SHOW BINARY LOG STATUS"
-	if eq, err := c.conn.CompareServerVersion("8.4.0"); (err == nil) && (eq < 0) {
-		showBinlogStatus = "SHOW MASTER STATUS"
+// getShowBinaryLogQuery returns the correct SQL statement to query binlog status
+// for the given database flavor and server version.
+//
+// Sources:
+//
+//	MySQL:   https://dev.mysql.com/doc/relnotes/mysql/8.4/en/news-8-4-0.html
+//	MariaDB: https://mariadb.com/kb/en/show-binlog-status
+func getShowBinaryLogQuery(flavor, serverVersion string) string {
+	switch flavor {
+	case mysql.MariaDBFlavor:
+		eq, err := mysql.CompareServerVersions(serverVersion, "10.5.2")
+		if (err == nil) && (eq >= 0) {
+			return "SHOW BINLOG STATUS"
+		}
+	case mysql.MySQLFlavor:
+		eq, err := mysql.CompareServerVersions(serverVersion, "8.4.0")
+		if (err == nil) && (eq >= 0) {
+			return "SHOW BINARY LOG STATUS"
+		}
 	}
 
-	rr, err := c.Execute(showBinlogStatus)
+	return "SHOW MASTER STATUS"
+}
+
+func (c *Canal) GetMasterPos() (mysql.Position, error) {
+	query := getShowBinaryLogQuery(c.cfg.Flavor, c.conn.GetServerVersion())
+
+	rr, err := c.Execute(query)
 	if err != nil {
 		return mysql.Position{}, errors.Trace(err)
 	}
